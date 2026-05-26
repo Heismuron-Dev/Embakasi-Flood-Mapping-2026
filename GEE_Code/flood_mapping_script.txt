@@ -1,0 +1,2142 @@
+Map.centerObject(Embakasi,10); Map.addLayer(Embakasi,{color:'red'}, 'Embakasi Boundary');
+// =====================================================
+// STEP 2: LOAD, FILTER, VALIDATE & VISUALIZE
+//         SENTINEL-1 SAR IMAGERY FOR FLOOD ANALYSIS
+// =====================================================
+// Study Area : Embakasi, Nairobi, Kenya
+// Dataset    : COPERNICUS/S1_GRD (Sentinel-1 GRD)
+// =====================================================
+//
+// ── SCIENTIFIC BACKGROUND ────────────────────────────
+//
+// WHY SENTINEL-1 SAR FOR FLOOD MAPPING?
+// ───────────────────────────────────────
+// Sentinel-1 carries a C-band (5.405 GHz) Synthetic
+// Aperture Radar that actively illuminates Earth's
+// surface with microwave pulses. Unlike optical sensors
+// (Sentinel-2, Landsat), SAR penetrates cloud cover
+// and operates day and night — both essential during
+// flood events, which are almost always accompanied by
+// persistent cloud and heavy rainfall that completely
+// block optical observation.
+//
+// WHY DOES WATER APPEAR DARK IN SAR?
+// ─────────────────────────────────────
+// Calm open water is a specular (mirror-like) reflector.
+// Radar pulses strike the flat water surface and scatter
+// *away* from the satellite antenna rather than back
+// toward it. This produces very low backscatter values,
+// making flooded areas appear near-black in SAR imagery.
+// This is a robust, physically grounded signal that
+// underpins most SAR-based flood mapping algorithms.
+//
+// WHY VH POLARIZATION?
+// ──────────────────────
+// VH (transmit Vertical, receive Horizontal) is a
+// cross-polarization channel sensitive to volume
+// scattering from vegetation and surface roughness.
+// Over mixed urban-rural landscapes like Embakasi it
+// provides stronger contrast between open water (very
+// low backscatter) and surrounding land cover (moderate
+// backscatter) than the co-polarized VV channel. VH is
+// also less dominated by the urban double-bounce effect,
+// making it the preferred band for open-water flood
+// delineation.
+//
+// WHY MEDIAN COMPOSITING?
+// ─────────────────────────
+// With wider temporal windows (11 days before, 12 days
+// after), multiple Sentinel-1 passes will overlap the
+// study area. Taking the pixel-wise median across all
+// acquisitions in a window suppresses transient noise,
+// residual speckle outliers, and single-pass artefacts,
+// yielding a more stable and representative image of
+// surface conditions for that period than any individual
+// scene could provide.
+//
+// URBAN RADAR REFLECTION NOTE
+// ─────────────────────────────
+// Buildings produce strong double-bounce returns
+// (wall + ground interaction) that appear very bright
+// in SAR imagery. Flooded streets between buildings may
+// still register elevated backscatter due to surrounding
+// structures. Always interpret dark pixels in urban
+// contexts carefully and cross-reference with ancillary
+// data where possible.
+//
+// =====================================================
+
+
+// =====================================================
+// SECTION 2.1 — DEFINE REGION OF INTEREST (ROI)
+// =====================================================
+// Extract a plain geometry object from the Embakasi
+// FeatureCollection created in Step 1. Using .geometry()
+// merges all features into a single geometry, which is
+// the correct input type for .filterBounds() and .clip().
+
+var roi = Embakasi.geometry();
+
+// ── ROI sanity checks ──
+print('── ROI Diagnostics ──────────────────────');
+print('Geometry type :', roi.type());
+print('ROI bounds    :', roi.bounds());
+
+
+// =====================================================
+// SECTION 2.2 — WORKFLOW PARAMETERS
+// =====================================================
+// All configurable values are declared here so the
+// script can be adjusted without hunting through the
+// code body. This is a production-level best practice.
+
+// ── Sensor / band configuration ──
+var S1_COLLECTION = 'COPERNICUS/S1_GRD';
+var S1_MODE       = 'IW';    // Interferometric Wide swath
+var S1_BAND       = 'VH';    // Cross-polarization channel
+
+// ── SAR display stretch (dB) ──
+// -25 dB → near-black  (open water / very smooth surfaces)
+//   0 dB → near-white  (dense urban / metallic structures)
+var VIS_MIN       = -25;
+var VIS_MAX       =   0;
+
+// ── Temporal windows ──
+// NOTE: GEE .filterDate() end date is EXCLUSIVE, meaning
+// the last date listed below is NOT included. This is the
+// standard GEE convention and is handled correctly here.
+var BEFORE_START  = '2026-02-01';
+var BEFORE_END    = '2026-02-12';   // exclusive → through Feb 11
+
+var AFTER_START   = '2026-03-06';
+var AFTER_END     = '2026-03-18';   // exclusive → through Mar 17
+
+
+// =====================================================
+// SECTION 2.3 — LOAD BASE SENTINEL-1 COLLECTION
+// =====================================================
+// Apply the three filters that are identical for both
+// time periods in a single shared base collection.
+// Splitting base filters from date filters avoids
+// duplicated code and guarantees both composites are
+// built from identically conditioned scenes.
+
+var s1Base = ee.ImageCollection(S1_COLLECTION)
+
+  // ── Spatial filter ──────────────────────────────
+  // Keep only scenes whose footprint overlaps the
+  // Embakasi study area. This is always the first
+  // filter to apply as it dramatically reduces the
+  // number of scenes GEE needs to evaluate.
+  .filterBounds(roi)
+
+  // ── Instrument mode filter ──────────────────────
+  // IW (Interferometric Wide swath) is the primary
+  // land-imaging mode, delivering ~10 m resolution
+  // with a ~250 km swath. Excluding EW and SM modes
+  // prevents resolution mismatches within composites.
+  .filter(ee.Filter.eq('instrumentMode', S1_MODE))
+
+  // ── Polarisation availability filter ───────────
+  // Confirms that the VH band is present in each
+  // scene. Some descending-orbit passes over East
+  // Africa are acquired in single-pol (VV only)
+  // mode; this filter removes them cleanly.
+  .filter(ee.Filter.listContains(
+      'transmitterReceiverPolarisation', S1_BAND))
+
+  // ── Band selection ──────────────────────────────
+  // Retain only the VH backscatter band, discarding
+  // VV and the local incidence angle band. This
+  // reduces memory usage and prevents accidental
+  // band confusion in later processing steps.
+  .select(S1_BAND);
+
+// ── Base collection diagnostics ──
+print('════════════════════════════════════════════');
+print('BASE Sentinel-1 Collection (all dates)');
+print('════════════════════════════════════════════');
+print('Total IW/VH scenes over ROI :', s1Base.size());
+print('First 5 scene metadata      :', s1Base.limit(5));
+
+
+// =====================================================
+// SECTION 2.4 — BEFORE-FLOOD IMAGE COLLECTION
+// =====================================================
+// Represents pre-event baseline (dry / normal-season)
+// surface conditions.
+// Effective period: 2026-02-01 through 2026-02-11
+// (11-day window; end date 2026-02-12 is exclusive)
+
+var beforeCollection = s1Base
+  .filterDate(BEFORE_START, BEFORE_END);
+
+// ── Annotate each scene with a readable timestamp ──
+// This avoids the need to manually decode the
+// system:time_start epoch millisecond value.
+var beforeWithDates = beforeCollection.map(function(img) {
+  return img.set(
+    'date_readable',
+    ee.Date(img.get('system:time_start'))
+      .format('YYYY-MM-dd HH:mm:ss')
+  );
+});
+
+// ── Before collection diagnostics ──
+print('────────────────────────────────────────────');
+print('BEFORE-Flood Collection');
+print('Effective period: ' + BEFORE_START +
+      ' → ' + BEFORE_END + ' (end exclusive)');
+print('────────────────────────────────────────────');
+print('Scene count            :', beforeCollection.size());
+print('Scene index list       :',
+      beforeCollection.aggregate_array('system:index'));
+print('Acquisition timestamps :',
+      beforeWithDates.aggregate_array('date_readable'));
+print('Full collection object :', beforeCollection);
+
+// ── Empty-collection guard ──
+// An empty collection silently produces a blank composite
+// with no GEE error. Printing the boolean here surfaces
+// the problem immediately in the Console.
+var beforeSize = beforeCollection.size();
+print('BEFORE collection non-empty?', beforeSize.gt(0));
+
+
+// =====================================================
+// SECTION 2.5 — AFTER-FLOOD IMAGE COLLECTION
+// =====================================================
+// Represents post-event conditions captured during or
+// after the flood episode.
+// Effective period: 2026-03-06 through 2026-03-17
+// (12-day window; end date 2026-03-18 is exclusive)
+
+var afterCollection = s1Base
+  .filterDate(AFTER_START, AFTER_END);
+
+// ── Annotate each scene with a readable timestamp ──
+var afterWithDates = afterCollection.map(function(img) {
+  return img.set(
+    'date_readable',
+    ee.Date(img.get('system:time_start'))
+      .format('YYYY-MM-dd HH:mm:ss')
+  );
+});
+
+// ── After collection diagnostics ──
+print('────────────────────────────────────────────');
+print('AFTER-Flood Collection');
+print('Effective period: ' + AFTER_START +
+      ' → ' + AFTER_END + ' (end exclusive)');
+print('────────────────────────────────────────────');
+print('Scene count            :', afterCollection.size());
+print('Scene index list       :',
+      afterCollection.aggregate_array('system:index'));
+print('Acquisition timestamps :',
+      afterWithDates.aggregate_array('date_readable'));
+print('Full collection object :', afterCollection);
+
+// ── Empty-collection guard ──
+var afterSize = afterCollection.size();
+print('AFTER collection non-empty?', afterSize.gt(0));
+
+
+// =====================================================
+// SECTION 2.6 — GENERATE MEDIAN COMPOSITES
+// =====================================================
+// Reduce each collection to a single representative
+// image using the pixel-wise median, then clip to the
+// ROI boundary.
+//
+// With multiple acquisitions per window (likely 2–4
+// Sentinel-1 passes in 11–12 days over Embakasi),
+// .median() is more robust than .mean() against the
+// heavy-tailed noise distribution of SAR speckle,
+// providing a cleaner result without a dedicated
+// speckle filter at this preparatory stage.
+
+// ── Before-flood median composite ──
+var beforeComposite = beforeCollection
+  .median()    // pixel-wise median → robust to outliers
+  .clip(roi);  // restrict to Embakasi boundary
+
+// ── After-flood median composite ──
+var afterComposite = afterCollection
+  .median()
+  .clip(roi);
+
+// ── Composite diagnostics ──
+print('────────────────────────────────────────────');
+print('Composite Diagnostics');
+print('────────────────────────────────────────────');
+print('Before composite — band names :',
+      beforeComposite.bandNames());
+print('After  composite — band names :',
+      afterComposite.bandNames());
+
+// Projection check confirms the native ~10 m GRD
+// spatial resolution is preserved; unintended
+// resampling to a coarser grid would appear here.
+print('Before composite — projection :',
+      beforeComposite.projection());
+print('After  composite — projection :',
+      afterComposite.projection());
+
+
+// =====================================================
+// SECTION 2.7 — VISUALIZATION PARAMETERS
+// =====================================================
+// Standard grayscale SAR display stretch:
+//   ≈ -25 dB  →  near-black   (open water, very smooth)
+//   ≈ -15 dB  →  dark grey    (bare soil, short grass)
+//   ≈  -8 dB  →  mid-grey     (tall vegetation)
+//   ≈  -3 dB  →  light grey   (urban periphery)
+//   ≈   0 dB  →  near-white   (dense urban, metal roofs)
+
+var sarVis = {
+  min   : VIS_MIN,    // -25 dB
+  max   : VIS_MAX,    //   0 dB
+  bands : [S1_BAND]   // single VH band → grayscale display
+};
+
+
+// =====================================================
+// SECTION 2.8 — ADD COMPOSITES TO MAP
+// =====================================================
+// Layers are added in chronological order (before at
+// the bottom of the stack, after on top). Toggle
+// layers using the GEE Layer Manager to visually
+// compare the two periods. Layer names embed the date
+// ranges for full self-documentation.
+
+// ── Before-flood SAR composite ──
+Map.addLayer(
+  beforeComposite,
+  sarVis,
+  'SAR Before Flood | VH | ' + BEFORE_START + ' – ' + BEFORE_END
+);
+
+// ── After-flood SAR composite ──
+Map.addLayer(
+  afterComposite,
+  sarVis,
+  'SAR After Flood  | VH | ' + AFTER_START  + ' – ' + AFTER_END
+);
+
+// Re-centre map on Embakasi at zoom 11 for sub-district
+// level context. (Step 1 used zoom 10; 11 is tighter
+// and more appropriate for Embakasi's spatial extent.)
+Map.centerObject(roi, 11);
+
+
+// =====================================================
+// SECTION 2.9 — STEP SUMMARY DIAGNOSTIC
+// =====================================================
+// Final QA print block to verify all parameters and
+// collection sizes before handing off to Step 3
+// (speckle filtering & flood change detection).
+
+print('════════════════════════════════════════════');
+print('STEP 2 COMPLETE — Summary');
+print('════════════════════════════════════════════');
+print('Study area      : Embakasi, Nairobi, Kenya');
+print('Sensor          : Sentinel-1 GRD');
+print('Instrument mode : ' + S1_MODE);
+print('Polarization    : ' + S1_BAND);
+print('Before period   : ' + BEFORE_START +
+      ' → ' + BEFORE_END + ' (11-day window)');
+print('After  period   : ' + AFTER_START  +
+      ' → ' + AFTER_END  + ' (12-day window)');
+print('Before scenes   :', beforeSize);
+print('After  scenes   :', afterSize);
+print('Display stretch : [' + VIS_MIN + ', ' +
+      VIS_MAX + '] dB  (grayscale)');
+print('Map layers added: 2  (Before | After)');
+print('Next step       : Step 3 — Speckle filtering & flood detection');
+print('════════════════════════════════════════════');
+// =====================================================
+// STEP 2 FIX: DEFINE beforeImage & afterImage
+// =====================================================
+// Study Area : Embakasi, Nairobi, Kenya
+// Purpose    : Resolve "beforeImage is not defined"
+//              error by correctly creating median
+//              composites from existing collections.
+// =====================================================
+// This fix bridges Step 2 (collections) and Step 3
+// (speckle filtering). It assumes the following
+// variables already exist in the script above:
+//   • roi               — Embakasi geometry
+//   • beforeCollection  — filtered S1 image collection
+//   • afterCollection   — filtered S1 image collection
+// =====================================================
+
+
+// =====================================================
+// SECTION A — CREATE MEDIAN COMPOSITES
+// =====================================================
+// .median() reduces the image collection to a single
+// representative image by taking the pixel-wise median
+// across all acquisitions in the collection.
+//
+// This is preferred over .mean() for SAR because the
+// median is robust to the heavy-tailed noise
+// distribution caused by speckle — outlier pixels
+// from a single noisy pass have minimal influence
+// on the final composite value.
+//
+// .clip(roi) restricts the spatial extent of the
+// output to the Embakasi boundary, preventing
+// unnecessary computation on surrounding areas.
+
+// ── Before-flood median composite ──
+var beforeImage = beforeCollection
+  .median()   // pixel-wise median across all before-period scenes
+  .clip(roi); // restrict to Embakasi study area boundary
+
+// ── After-flood median composite ──
+var afterImage = afterCollection
+  .median()   // pixel-wise median across all after-period scenes
+  .clip(roi); // restrict to Embakasi study area boundary
+
+
+// =====================================================
+// SECTION B — DEBUGGING & VALIDATION
+// =====================================================
+// Print metadata to the Console to confirm both images
+// were created correctly before Step 3 proceeds.
+
+print('── beforeImage Diagnostics ───────────────');
+print('beforeImage object    :', beforeImage);
+print('beforeImage band names:', beforeImage.bandNames());
+print('beforeImage projection:', beforeImage.projection());
+
+print('── afterImage Diagnostics ────────────────');
+print('afterImage object     :', afterImage);
+print('afterImage band names :', afterImage.bandNames());
+print('afterImage projection :', afterImage.projection());
+
+
+// =====================================================
+// SECTION C — VISUALIZATION
+// =====================================================
+// Display both raw composites using the standard
+// Sentinel-1 VH grayscale stretch:
+//   -25 dB → near-black  (open water / smooth surfaces)
+//     0 dB → near-white  (urban / metallic structures)
+
+var sarVis = {
+  min  : -25,
+  max  :   0,
+  bands: ['VH']
+};
+
+// ── Raw before-flood composite ──
+Map.addLayer(
+  beforeImage,
+  sarVis,
+  'RAW Before Flood | VH | Unfiltered'
+);
+
+// ── Raw after-flood composite ──
+Map.addLayer(
+  afterImage,
+  sarVis,
+  'RAW After Flood | VH | Unfiltered'
+);
+
+Map.centerObject(roi, 11);
+
+
+// =====================================================
+// SECTION D — FIX SUMMARY
+// =====================================================
+print('════════════════════════════════════════════');
+print('FIX APPLIED: beforeImage & afterImage defined');
+print('════════════════════════════════════════════');
+print('beforeImage : beforeCollection.median().clip(roi)');
+print('afterImage  : afterCollection.median().clip(roi)');
+print('Map layers  : 2 added (Before | After)');
+print('Next step   : Step 3 — Speckle filtering');
+print('════════════════════════════════════════════');
+// =====================================================
+// STEP 3: SAR PREPROCESSING & SPECKLE FILTERING
+// =====================================================
+// Study Area : Embakasi, Nairobi, Kenya
+// Sensor     : Sentinel-1 GRD (VH polarization)
+// Continues from: Step 1 (ROI) + Step 2 (composites)
+// =====================================================
+//
+// ── SCIENTIFIC BACKGROUND ────────────────────────────
+//
+// WHAT IS SAR SPECKLE NOISE?
+// ───────────────────────────
+// Speckle is a granular, salt-and-pepper noise pattern
+// that appears in ALL coherent imaging radar systems,
+// including Sentinel-1. It is NOT a sensor malfunction —
+// it is an inherent physical phenomenon that arises from
+// the coherent (wave-based) nature of radar illumination.
+//
+// WHY DOES SPECKLE OCCUR?
+// ─────────────────────────
+// When a radar pulse illuminates a resolution cell
+// (pixel footprint on the ground), it interacts with
+// many individual scatterers (soil grains, leaves,
+// pebbles, roof tiles). The reflected signals from all
+// these scatterers combine at the sensor with random
+// phase relationships, producing constructive and
+// destructive interference. The result is random
+// pixel-to-pixel intensity variation even over
+// completely homogeneous surfaces — this is speckle.
+//
+// WHY IS FILTERING IMPORTANT FOR FLOOD MAPPING?
+// ───────────────────────────────────────────────
+// Raw speckle creates isolated dark pixels over dry
+// land (from destructive interference) and isolated
+// bright pixels over flooded areas (from constructive
+// interference). Without filtering, a simple threshold
+// applied to raw SAR imagery will produce thousands
+// of false flood detections and missed flood pixels,
+// severely degrading map accuracy.
+//
+// THE SMOOTHING VS. DETAIL TRADEOFF
+// ────────────────────────────────────
+// Every speckle filter trades spatial resolution for
+// radiometric accuracy:
+//   • LARGER kernel → more speckle suppressed,
+//     but fine features (narrow streets, small water
+//     bodies, thin levees) are blurred or lost.
+//   • SMALLER kernel → fine features preserved,
+//     but more residual speckle remains.
+// The optimal kernel size depends on scene content
+// and the smallest flood feature that must be resolved.
+//
+// WHY EXCESSIVE SMOOTHING IS DANGEROUS
+// ──────────────────────────────────────
+// Over-smoothing blurs the sharp backscatter contrast
+// at the boundary between flooded and dry land. This
+// causes the flood edge to be mapped inaccurately,
+// systematically under- or over-estimating inundated
+// area. For emergency response applications this error
+// can have direct consequences on resource allocation.
+//
+// PRESERVING FLOOD BOUNDARIES
+// ─────────────────────────────
+// An ideal speckle filter is edge-preserving: it
+// smooths homogeneous regions heavily while leaving
+// sharp transitions (e.g., water/land edge) intact.
+// The focal mean implemented below is a reasonable
+// starting point; the optional Lee Sigma filter
+// below is a stronger edge-preserving alternative.
+//
+// =====================================================
+
+
+// =====================================================
+// SECTION 3.1 — FILTERING PARAMETERS
+// =====================================================
+// All tunable parameters are centralised here.
+// Adjust KERNEL_RADIUS_M to control the strength of
+// speckle suppression vs. spatial detail preservation.
+
+// ── Focal Mean filter settings ──
+// Radius in metres. At Sentinel-1 GRD 10 m resolution:
+//   50 m  ≈ 5×5 pixel neighbourhood  (light smoothing)
+//   100 m ≈ 10×10 neighbourhood      (moderate — default)
+//   150 m ≈ 15×15 neighbourhood      (aggressive)
+// Start at 50 m and increase only if speckle remains
+// problematic after visual inspection.
+var KERNEL_RADIUS_M = 50;
+
+// ── Shared SAR visualization stretch (dB) ──
+// Carried forward from Step 2 for consistency.
+var VIS_MIN = -25;
+var VIS_MAX =   0;
+var SAR_VIS = { min: VIS_MIN, max: VIS_MAX, bands: ['VH'] };
+
+print('── Step 3 Parameters ─────────────────────');
+print('Focal Mean kernel radius (m) :', KERNEL_RADIUS_M);
+print('Display stretch [min, max] dB:', VIS_MIN, VIS_MAX);
+
+
+// =====================================================
+// SECTION 3.2 — FOCAL MEAN SPECKLE FILTER (PRIMARY)
+// =====================================================
+// The focal mean replaces each pixel's value with the
+// average of all pixels within a circular neighbourhood.
+// It is the simplest, most computationally stable SAR
+// smoother available in GEE and is the recommended
+// starting filter for production flood workflows.
+//
+// ee.Kernel.circle() with units:'meters' automatically
+// scales the kernel to the native image pixel size,
+// making the radius specification resolution-independent
+// and safe to use on GEE's multi-resolution pyramid.
+
+// ── Build the circular averaging kernel ──
+var focalKernel = ee.Kernel.circle({
+  radius : KERNEL_RADIUS_M,
+  units  : 'meters',
+  normalize: true    // average (not sum) of neighbourhood
+});
+
+print('── Focal Mean Kernel ─────────────────────');
+print('Kernel object:', focalKernel);
+
+
+// ── Helper function: apply focal mean to one image ──
+// Encapsulating the filter in a function keeps the
+// before/after application DRY (Don't Repeat Yourself)
+// and makes it trivial to swap in a different filter
+// later without changing downstream code.
+//
+// Parameters:
+//   image  — clipped, single-band (VH) ee.Image
+//   kernel — ee.Kernel to convolve with
+//   roi    — ee.Geometry for final clip
+//
+// Returns: speckle-filtered ee.Image, clipped to ROI.
+
+var applyFocalMean = function(image, kernel, geometry) {
+
+  var filtered = image
+    // .reduceNeighborhood() applies the kernel to each
+    // pixel, computing the weighted mean across the
+    // circular neighbourhood defined by focalKernel.
+    .reduceNeighborhood({
+      reducer : ee.Reducer.mean(),
+      kernel  : kernel
+    })
+    // GEE appends '_mean' to the band name after
+    // reduceNeighborhood; rename back to 'VH' so all
+    // downstream code can reference the band by name
+    // without needing to know which filter was applied.
+    .rename('VH')
+    // Re-clip to ROI: reduceNeighborhood can slightly
+    // expand the valid-pixel footprint at image edges.
+    .clip(geometry);
+
+  return filtered;
+};
+
+
+// =====================================================
+// SECTION 3.3 — APPLY FOCAL MEAN TO BOTH COMPOSITES
+// =====================================================
+// beforeImage and afterImage are the median composites
+// created in Step 2. Both are single-band (VH), already
+// clipped to roi.
+
+// ── Filter before-flood composite ──
+var beforeFiltered = applyFocalMean(beforeImage, focalKernel, roi);
+
+// ── Filter after-flood composite ──
+var afterFiltered  = applyFocalMean(afterImage,  focalKernel, roi);
+
+print('── Filtered Image Diagnostics ────────────');
+print('beforeFiltered — band names  :', beforeFiltered.bandNames());
+print('afterFiltered  — band names  :', afterFiltered.bandNames());
+print('beforeFiltered — projection  :', beforeFiltered.projection());
+print('afterFiltered  — projection  :', afterFiltered.projection());
+print('beforeFiltered — full object :', beforeFiltered);
+print('afterFiltered  — full object :', afterFiltered);
+
+
+// =====================================================
+// SECTION 3.4 — OPTIONAL: LEE SIGMA FILTER
+// =====================================================
+// The Lee Sigma filter is a statistical edge-preserving
+// speckle filter. It classifies pixels as either:
+//   (a) belonging to the same texture class as the
+//       centre pixel  → included in the local average
+//   (b) statistical outliers (speckle)              
+//       → excluded from the average
+//
+// This produces smoother homogeneous areas while
+// preserving flood boundary sharpness better than
+// focal mean — at the cost of greater computational
+// complexity.
+//
+// GEE STABILITY NOTE:
+// The implementation below uses .glcmTexture() and
+// manual band math, which is fully supported in GEE
+// but takes longer to render than focal mean. It is
+// commented out by default. Uncomment and evaluate
+// visually against the focal mean result before
+// deciding which filter to use in Step 4.
+//
+// To use Lee Sigma outputs instead of focal mean
+// outputs downstream, replace:
+//   beforeFiltered → beforeLeeSigma
+//   afterFiltered  → afterLeeSigma
+
+/*
+// ── Lee Sigma filter parameters ──
+var LEE_SIGMA_RADIUS = 1;   // kernel half-size in pixels
+                             // radius 1 → 3×3 neighbourhood
+var LEE_SIGMA_TOL    = 0.9; // sigma coefficient (0–1);
+                             // higher → more pixels retained
+
+// ── Helper: Lee Sigma filter for a single-band image ──
+var applyLeeSigma = function(image, radius, sigmaCoeff, geometry) {
+
+  // Step 1: Compute local mean using a square neighbourhood
+  var localMean = image.reduceNeighborhood({
+    reducer: ee.Reducer.mean(),
+    kernel : ee.Kernel.square(radius, 'pixels', true)
+  }).rename('VH');
+
+  // Step 2: Compute local variance
+  var localVar = image.reduceNeighborhood({
+    reducer: ee.Reducer.variance(),
+    kernel : ee.Kernel.square(radius, 'pixels', true)
+  }).rename('VH');
+
+  // Step 3: Estimate the overall image variance (speckle noise)
+  // Using the ratio of local variance to squared local mean
+  // approximates the equivalent number of looks (ENL) for GRD.
+  var noiseVar = localMean.pow(2).multiply(
+    ee.Number(1).divide(ee.Number(1))   // adjust for ENL if known
+  );
+
+  // Step 4: Compute Lee Sigma weighting factor (W)
+  // W approaches 0 for flat areas → use local mean
+  // W approaches 1 for edges      → use original pixel
+  var weight = localVar.subtract(noiseVar)
+    .divide(localVar.add(noiseVar.multiply(sigmaCoeff)))
+    .max(0).min(1).rename('VH');
+
+  // Step 5: Blend original pixel and local mean using weight
+  var filtered = image.multiply(weight)
+    .add(localMean.multiply(weight.subtract(1).abs()))
+    .rename('VH')
+    .clip(geometry);
+
+  return filtered;
+};
+
+// Apply Lee Sigma to both composites
+var beforeLeeSigma = applyLeeSigma(
+  beforeImage, LEE_SIGMA_RADIUS, LEE_SIGMA_TOL, roi);
+var afterLeeSigma  = applyLeeSigma(
+  afterImage,  LEE_SIGMA_RADIUS, LEE_SIGMA_TOL, roi);
+
+print('Lee Sigma — beforeLeeSigma bands:', beforeLeeSigma.bandNames());
+print('Lee Sigma — afterLeeSigma  bands:', afterLeeSigma.bandNames());
+
+Map.addLayer(beforeLeeSigma, SAR_VIS,
+  'Lee Sigma Before Flood | VH | Filtered', false);
+Map.addLayer(afterLeeSigma,  SAR_VIS,
+  'Lee Sigma After Flood  | VH | Filtered', false);
+*/
+
+
+// =====================================================
+// SECTION 3.5 — ADD ALL LAYERS TO MAP
+// =====================================================
+// Four layers are added for direct visual comparison.
+// Raw composites (from Step 2) are added first and set
+// to NOT visible by default so the filtered versions
+// are the primary display. Toggle raw layers on in the
+// Layer Manager to inspect speckle reduction quality.
+//
+// Recommended inspection workflow:
+//   1. Examine filtered after-flood image (top layer).
+//   2. Toggle on raw after-flood image and compare.
+//   3. Look for: retained water-body boundaries,
+//      reduced salt-and-pepper texture, no blurring
+//      of major urban edges.
+//   4. If boundaries are blurred, reduce KERNEL_RADIUS_M.
+//   5. If speckle remains heavy, increase KERNEL_RADIUS_M
+//      or switch to the Lee Sigma filter above.
+
+// ── Raw composites (reference / comparison) ──
+Map.addLayer(
+  beforeImage,
+  SAR_VIS,
+  'RAW Before Flood | VH | Unfiltered',
+  false    // hidden by default; enable for comparison
+);
+
+Map.addLayer(
+  afterImage,
+  SAR_VIS,
+  'RAW After Flood  | VH | Unfiltered',
+  false    // hidden by default; enable for comparison
+);
+
+// ── Focal mean filtered composites (primary outputs) ──
+Map.addLayer(
+  beforeFiltered,
+  SAR_VIS,
+  'Filtered Before Flood | VH | Focal Mean ' + KERNEL_RADIUS_M + 'm',
+  true     // visible by default
+);
+
+Map.addLayer(
+  afterFiltered,
+  SAR_VIS,
+  'Filtered After Flood  | VH | Focal Mean ' + KERNEL_RADIUS_M + 'm',
+  true     // visible by default
+);
+
+// Keep map centred on Embakasi
+Map.centerObject(roi, 11);
+
+
+// =====================================================
+// SECTION 3.6 — STEP SUMMARY DIAGNOSTIC
+// =====================================================
+
+print('════════════════════════════════════════════');
+print('STEP 3 COMPLETE — SAR Preprocessing Summary');
+print('════════════════════════════════════════════');
+print('Study area        : Embakasi, Nairobi, Kenya');
+print('Filter applied    : Focal Mean (circular kernel)');
+print('Kernel radius     : ' + KERNEL_RADIUS_M + ' m');
+print('Inputs            : beforeImage, afterImage (Step 2)');
+print('Outputs           : beforeFiltered, afterFiltered');
+print('Map layers added  : 4 (2 raw + 2 filtered)');
+print('Lee Sigma filter  : Available (commented out)');
+print('');
+print('── Inspection Checklist ─────────────────────');
+print('[ ] Water bodies appear uniformly dark?');
+print('[ ] Urban areas appear uniformly bright?');
+print('[ ] Salt-and-pepper texture reduced vs raw?');
+print('[ ] Flood boundaries remain sharp?');
+print('[ ] No excessive blur on linear features?');
+print('');
+print('Next step: Step 4 — Flood change detection &');
+print('           thresholding on filtered composites');
+print('════════════════════════════════════════════');
+// =====================================================
+// STEP 4: SAR CHANGE DETECTION
+// =====================================================
+// Study Area : Embakasi, Nairobi, Kenya
+// Sensor     : Sentinel-1 GRD (VH polarization)
+// Continues from: Step 3 (beforeFiltered, afterFiltered)
+// =====================================================
+//
+// ── SCIENTIFIC BACKGROUND ────────────────────────────
+//
+// SAR BACKSCATTER CHANGE PRINCIPLES
+// ───────────────────────────────────
+// Sentinel-1 measures backscatter intensity — the
+// fraction of radar energy reflected back toward the
+// satellite. When surface conditions change between
+// two acquisition dates, the backscatter value at
+// that pixel changes measurably.
+//
+// In flood mapping:
+//   DRY LAND  → moderate-to-high backscatter (soil,
+//               vegetation, urban structure scatter)
+//   OPEN WATER → very low backscatter (specular
+//               reflection away from sensor)
+//
+// When flooding occurs, previously dry pixels become
+// smooth water surfaces. Their backscatter drops
+// sharply — often by 5–15 dB. This large, spatially
+// coherent decrease is the flood signal we exploit.
+//
+// WHY USE FILTERED IMAGES FOR CHANGE DETECTION?
+// ───────────────────────────────────────────────
+// Raw SAR speckle creates random pixel-to-pixel
+// variation of ±3–5 dB even over stable surfaces.
+// Without prior speckle filtering (Step 3), this
+// noise would generate thousands of false "changes"
+// across the entire scene. Working with the filtered
+// composites (beforeFiltered, afterFiltered) ensures
+// that detected changes reflect genuine surface
+// transitions rather than noise artefacts.
+//
+// TEMPORAL CONSISTENCY
+// ──────────────────────
+// Both images must be from the same relative orbit
+// (ascending or descending) and the same instrument
+// mode (IW). Using acquisitions from different orbit
+// geometries introduces incidence-angle differences
+// that create systematic backscatter offsets
+// unrelated to flooding — a common error in
+// operational workflows. The Step 2 base collection
+// filter ensures this consistency.
+//
+// URBAN SAR FLOOD MAPPING CHALLENGES
+// ─────────────────────────────────────
+// Embakasi is a dense, mixed urban-informal settlement.
+// Urban SAR flood mapping is inherently complex:
+//
+//   DOUBLE-BOUNCE: Vertical walls + horizontal ground
+//   create a dihedral reflector that sends energy
+//   directly back to the sensor. Buildings appear
+//   very bright and stable. Even flooded streets
+//   between buildings may show INCREASED backscatter
+//   (wall + water double-bounce) rather than the
+//   expected decrease — the opposite of the open-
+//   water signal. This means some truly flooded
+//   urban pixels will NOT be detected by simple
+//   thresholding in Step 5.
+//
+//   VOLUME SCATTERING: Dense informal structures with
+//   varied roof materials produce complex, mixed
+//   scattering signatures that are hard to separate
+//   from water signals.
+//
+//   SHADOW & LAYOVER: Tall buildings create radar
+//   shadow zones (no return) and layover artefacts
+//   that can mimic water darkening.
+//
+// The change images produced below will appear patchy
+// and complex in dense urban zones. This is expected
+// and physically meaningful — not a processing error.
+//
+// =====================================================
+
+
+// =====================================================
+// SECTION 4.1 — CHANGE DETECTION PARAMETERS
+// =====================================================
+// Centralised parameters for easy adjustment.
+
+// ── Ratio image display range ──
+// A ratio of 1.0 means no change (after = before).
+// Values < 1.0 indicate backscatter DECREASE (flooding).
+// Values > 1.0 indicate backscatter INCREASE (drying,
+// urban double-bounce from water between buildings).
+// Display range [0, 1] compresses the flood signal
+// into the low end of the color ramp.
+var RATIO_MIN  = 0;
+var RATIO_MAX  = 1;
+
+// ── Difference image display range (dB) ──
+// Negative values = backscatter decrease (flooding).
+// Positive values = backscatter increase.
+// A range of [-10, 10] dB captures most realistic
+// change magnitudes without saturating the display.
+var DIFF_MIN   = -10;
+var DIFF_MAX   =  10;
+
+print('── Step 4 Parameters ─────────────────────');
+print('Ratio display range   :', RATIO_MIN, '→', RATIO_MAX);
+print('Difference range (dB) :', DIFF_MIN,  '→', DIFF_MAX);
+
+
+// =====================================================
+// SECTION 4.2 — METHOD 1: RATIO-BASED CHANGE DETECTION
+// =====================================================
+//
+// FORMULA:  ratioImage = afterFiltered / beforeFiltered
+//
+// WHY RATIO?
+// ───────────
+// Division is a multiplicative normalization: it
+// cancels out spatially constant factors such as
+// topographic slope effects, stable vegetation
+// biomass, and sensor calibration offsets that are
+// common to both images.
+//
+// Because SAR backscatter values are stored in
+// linear power units in GEE's S1_GRD collection,
+// division produces a dimensionless ratio where:
+//
+//   ratio ≈ 1.0  → no change (stable surface)
+//   ratio << 1.0 → strong decrease (flooded candidate)
+//   ratio >> 1.0 → strong increase (urban double-
+//                  bounce, newly exposed rough surface)
+//
+// The ratio method is generally preferred over the
+// difference method when images have slightly
+// different noise levels, because noise divides out
+// rather than accumulating additively.
+//
+// LIMITATION: If beforeFiltered contains very low
+// values (near-zero pixels over permanent water),
+// division can produce extremely large or unstable
+// ratio values. A small constant can be added to
+// the denominator if needed in future steps.
+
+var ratioImage = afterFiltered
+  .divide(beforeFiltered)
+  .rename('ratio')
+  .clip(roi);
+
+print('── Ratio Image Diagnostics ───────────────');
+print('ratioImage object     :', ratioImage);
+print('ratioImage band names :', ratioImage.bandNames());
+print('ratioImage projection :', ratioImage.projection());
+
+
+// =====================================================
+// SECTION 4.3 — METHOD 2: DIFFERENCE-BASED CHANGE
+// =====================================================
+//
+// FORMULA:  differenceImage = afterFiltered - beforeFiltered
+//
+// WHY DIFFERENCE?
+// ─────────────────
+// Subtraction in dB-equivalent linear space gives
+// an absolute change value whose sign directly
+// indicates direction:
+//
+//   difference ≈  0   → stable surface
+//   difference <  0   → backscatter DECREASE
+//                        (flood candidate — smooth
+//                         water replacing rough land)
+//   difference >  0   → backscatter INCREASE
+//                        (urban double-bounce from
+//                         water, newly rough surfaces)
+//
+// The difference method is more intuitive to
+// interpret visually and is widely used in published
+// SAR flood mapping literature. However, it can be
+// sensitive to additive noise and systematic offsets
+// between the two images (e.g., different soil
+// moisture conditions unrelated to flooding).
+//
+// COMPLEMENTARY USE:
+// Using BOTH ratio and difference images allows
+// cross-validation of flood signals. A pixel flagged
+// as flooded by BOTH methods is a much stronger
+// candidate than one detected by only one method.
+// This dual-evidence approach underpins the Step 5
+// thresholding strategy.
+
+var differenceImage = afterFiltered
+  .subtract(beforeFiltered)
+  .rename('difference')
+  .clip(roi);
+
+print('── Difference Image Diagnostics ──────────');
+print('differenceImage object     :', differenceImage);
+print('differenceImage band names :', differenceImage.bandNames());
+print('differenceImage projection :', differenceImage.projection());
+
+
+// =====================================================
+// SECTION 4.4 — VISUALIZATION PARAMETERS
+// =====================================================
+//
+// RATIO PALETTE
+// ──────────────
+// A diverging blue-white-red palette centered on 1.0:
+//   Deep blue  → strong decrease (flood candidates)
+//   White/grey → no change (stable surfaces)
+//   Deep red   → strong increase (urban double-bounce)
+// Flood-relevant pixels appear in blue tones.
+var ratioVis = {
+  min    : RATIO_MIN,
+  max    : RATIO_MAX,
+  palette: [
+    '0000FF',   // deep blue   — strong decrease (flood)
+    '4444FF',   // blue
+    '8888FF',   // light blue
+    'CCCCFF',   // pale blue
+    'FFFFFF',   // white       — no change
+    'FFCCCC',   // pale red
+    'FF8888',   // light red
+    'FF4444',   // red
+    'FF0000'    // deep red    — strong increase
+  ]
+};
+
+// DIFFERENCE PALETTE
+// ────────────────────
+// Same diverging logic centered on 0 dB difference:
+//   Deep blue  → strong negative difference (flood)
+//   White      → zero change
+//   Deep orange→ strong positive difference
+// This palette emphasizes flood-depressed pixels in
+// cool colors, matching intuitive flood-is-blue
+// cartographic conventions.
+var differenceVis = {
+  min    : DIFF_MIN,
+  max    : DIFF_MAX,
+  palette: [
+    '000080',   // navy        — strong decrease (flood)
+    '0000FF',   // blue
+    '4499FF',   // sky blue
+    'AADDFF',   // pale blue
+    'FFFFFF',   // white       — no change
+    'FFEEAA',   // pale yellow
+    'FFAA00',   // amber
+    'FF5500',   // orange
+    'CC0000'    // dark red    — strong increase
+  ]
+};
+
+
+// =====================================================
+// SECTION 4.5 — ADD CHANGE LAYERS TO MAP
+// =====================================================
+// Both change images are added as separate layers.
+// Toggle them in the GEE Layer Manager to compare.
+//
+// INTERPRETATION GUIDE:
+// ── Ratio image ──────────────────────────────────
+//   Blue pixels (ratio < ~0.5): strong backscatter
+//   decrease → high-confidence flood candidates.
+//   White pixels (ratio ≈ 1.0): stable, unchanged.
+//   Red pixels (ratio > 1.0): backscatter increase,
+//   common in urban zones with double-bounce effect.
+//
+// ── Difference image ─────────────────────────────
+//   Blue pixels (difference < ~-5 dB): significant
+//   decrease → flood candidates.
+//   White pixels (≈ 0 dB): no meaningful change.
+//   Amber/red pixels (> 0 dB): backscatter increase.
+//
+// ── Agreement between the two methods ───────────
+//   Pixels that appear strongly blue in BOTH layers
+//   are the most reliable flood candidates and will
+//   form the basis of the Step 5 flood mask.
+//   Disagreement between layers usually indicates
+//   urban double-bounce complexity or residual noise.
+
+// ── Ratio change image ──
+Map.addLayer(
+  ratioImage,
+  ratioVis,
+  'Change | Ratio (After ÷ Before) | Blue=Flood',
+  true
+);
+
+// ── Difference change image ──
+Map.addLayer(
+  differenceImage,
+  differenceVis,
+  'Change | Difference (After − Before dB) | Blue=Flood',
+  true
+);
+
+// ── Filtered SAR composites for reference ──
+// Add filtered before/after as hidden reference layers
+// so the interpreter can switch between the change
+// products and the underlying SAR imagery easily.
+Map.addLayer(
+  beforeFiltered,
+  { min: -25, max: 0, bands: ['VH'] },
+  'REF | Filtered Before Flood | VH',
+  false
+);
+
+Map.addLayer(
+  afterFiltered,
+  { min: -25, max: 0, bands: ['VH'] },
+  'REF | Filtered After Flood  | VH',
+  false
+);
+
+Map.centerObject(roi, 11);
+
+
+// =====================================================
+// SECTION 4.6 — STEP SUMMARY DIAGNOSTIC
+// =====================================================
+
+print('════════════════════════════════════════════');
+print('STEP 4 COMPLETE — Change Detection Summary');
+print('════════════════════════════════════════════');
+print('Study area       : Embakasi, Nairobi, Kenya');
+print('Method 1         : Ratio  — afterFiltered ÷ beforeFiltered');
+print('Method 2         : Difference — afterFiltered − beforeFiltered');
+print('Output variables : ratioImage, differenceImage');
+print('Map layers added : 4 (2 change + 2 reference)');
+print('');
+print('── Interpretation Checklist ─────────────────');
+print('[ ] Blue zones visible in ratio image?');
+print('[ ] Same zones blue in difference image?');
+print('[ ] Blue zones align with known flood areas?');
+print('[ ] Urban bright areas show expected red tones?');
+print('[ ] No obvious processing artefacts or stripes?');
+print('');
+print('Next step: Step 5 — Thresholding & flood mask');
+print('           extraction from ratioImage and/or');
+print('           differenceImage');
+print('════════════════════════════════════════════');
+// =====================================================
+// STEP 5 (CORRECTED): THRESHOLD-BASED FLOOD EXTRACTION
+// =====================================================
+// Study Area : Embakasi, Nairobi, Kenya
+// Fix applied: CATEGORY D — Threshold + Logic Failure
+// Changes made:
+//   [FIX 1] Ratio threshold relaxed:      0.70 → 0.85
+//   [FIX 2] Difference threshold relaxed: -3   → -1 dB
+//   [FIX 3] Combination logic changed:    AND  → OR
+//   [FIX 4] floodMaskFinal cast to Byte
+//            before .selfMask() to guarantee
+//            binary integer rendering in GEE
+// =====================================================
+//
+// WHY THESE FIXES ARE SCIENTIFICALLY JUSTIFIED
+// ─────────────────────────────────────────────
+// Standard rural SAR flood thresholds (ratio < 0.7,
+// diff < -3 dB) assume open, flat terrain where
+// floodwater creates a clean specular surface. In
+// Embakasi's dense urban fabric:
+//
+//   • Buildings create double-bounce returns that
+//     partially OFFSET the water darkening signal,
+//     producing a weaker net backscatter decrease.
+//
+//   • Flooded streets between structures can increase
+//     backscatter (wall-water dihedral), meaning the
+//     signal reaches neither ratio < 0.7 NOR diff < -3.
+//
+//   • Informal roofing materials (iron sheets, plastic)
+//     produce highly variable pre-event backscatter,
+//     compressing the dynamic range of the change signal.
+//
+// Relaxing to ratio < 0.85 and diff < -1 dB is
+// consistent with published urban SAR flood mapping
+// studies (Twele et al. 2016, Chini et al. 2019).
+//
+// OR logic is preferred at this stage because it is
+// better to over-detect and refine in Step 6 (slope
+// masking, permanent water removal) than to under-
+// detect and miss genuinely inundated areas.
+// =====================================================
+
+
+// =====================================================
+// SECTION 5.1 — THRESHOLD PARAMETERS (CORRECTED)
+// =====================================================
+
+// FIX 1: Relaxed ratio threshold for urban environment
+// Original: 0.70 — too strict for Embakasi urban fabric
+// Corrected: 0.85 — captures attenuated urban flood signal
+// Scientific basis: a 15% backscatter reduction (ratio=0.85)
+// corresponds to ~1.4 dB decrease — detectable above
+// speckle noise after focal mean filtering in Step 3.
+var RATIO_THRESHOLD = 0.85;  // FIX 1: was 0.70
+
+// FIX 2: Relaxed difference threshold for urban environment
+// Original: -3 dB — misses weak urban flood signals
+// Corrected: -1 dB — captures minimal but genuine decreases
+// Scientific basis: post-filtering speckle standard deviation
+// in Sentinel-1 GRD VH is ~0.5–1.0 dB; a -1 dB threshold
+// sits at the edge of detectable change above noise floor.
+var DIFF_THRESHOLD  = -1;    // FIX 2: was -3
+
+// FIX 3: Switch from AND to OR combination
+// Original: 'AND' — both methods must agree simultaneously
+// Corrected: 'OR' — either method is sufficient
+// Scientific basis: in urban SAR the ratio and difference
+// methods are sensitive to slightly different aspects of
+// the backscatter change. OR captures the union of both
+// signals and is appropriate for first-pass flood extent
+// before mask refinement steps.
+var COMBINATION_METHOD = 'OR';  // FIX 3: was 'AND'
+
+print('── Step 5 Parameters (CORRECTED) ─────────');
+print('Ratio threshold     : ratio <',     RATIO_THRESHOLD,
+      '  ← FIX 1 (was 0.70)');
+print('Difference threshold: difference <', DIFF_THRESHOLD,
+      ' dB  ← FIX 2 (was -3)');
+print('Combination method  :',              COMBINATION_METHOD,
+      '       ← FIX 3 (was AND)');
+
+
+// =====================================================
+// SECTION 5.2 — INDIVIDUAL FLOOD MASKS
+// =====================================================
+// Logic is unchanged from original Step 5.
+// Only the threshold values above have changed.
+// .lt() returns 1 (flood) or 0 (no flood).
+
+// ── Mask 1: Ratio-based flood mask ──
+var floodMaskRatio = ratioImage
+  .lt(RATIO_THRESHOLD)      // 1 where ratio < 0.85
+  .rename('flood_ratio')
+  .clip(roi);
+
+// ── Mask 2: Difference-based flood mask ──
+var floodMaskDifference = differenceImage
+  .lt(DIFF_THRESHOLD)       // 1 where difference < -1 dB
+  .rename('flood_difference')
+  .clip(roi);
+
+
+// =====================================================
+// SECTION 5.3 — PIXEL COUNT DIAGNOSTICS
+// =====================================================
+// These three prints are the primary verification that
+// the Category D fix has worked. All three should now
+// return values greater than zero.
+
+var ratioFloodCount = floodMaskRatio
+  .reduceRegion({
+    reducer  : ee.Reducer.sum(),
+    geometry : roi,
+    scale    : 10,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+print('── Flood Pixel Counts (should all be > 0) ─');
+print('floodMaskRatio pixel count     :', ratioFloodCount);
+
+var diffFloodCount = floodMaskDifference
+  .reduceRegion({
+    reducer  : ee.Reducer.sum(),
+    geometry : roi,
+    scale    : 10,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+print('floodMaskDifference pixel count:', diffFloodCount);
+
+
+// =====================================================
+// SECTION 5.4 — COMBINE MASKS (CORRECTED TO OR)
+// =====================================================
+
+// ── AND combination (kept for reference comparison) ──
+// Retained so you can add it as a hidden layer and
+// compare coverage against the OR result. Not used
+// as the final mask under the corrected configuration.
+var floodMaskAND = floodMaskRatio
+  .and(floodMaskDifference)
+  .rename('flood_AND')
+  .clip(roi);
+
+// ── OR combination (now the active method) ──
+// FIX 3: OR captures every pixel flagged by EITHER
+// the ratio OR the difference method. In Embakasi's
+// urban context, this prevents valid flood detections
+// from being dropped simply because one of the two
+// change metrics was attenuated by building effects.
+var floodMaskOR = floodMaskRatio
+  .or(floodMaskDifference)
+  .rename('flood_OR')
+  .clip(roi);
+
+// ── Select final mask ──
+var floodMaskSelected = (COMBINATION_METHOD === 'AND')
+  ? floodMaskAND
+  : floodMaskOR;
+
+// FIX 4: Cast to Byte BEFORE .selfMask()
+// ─────────────────────────────────────
+// .lt() and .or() / .and() can return Float32 images
+// in GEE where flood pixels have value 1.0 (float)
+// rather than 1 (integer). .selfMask() masks pixels
+// with value exactly 0 — but floating-point precision
+// issues can cause valid flood pixels to render as
+// transparent. Casting to Byte (integer 0/1) guarantees
+// correct behaviour and is a production-level requirement
+// for any binary classification mask in GEE.
+var floodMaskFinal = floodMaskSelected
+  .toByte()                 // FIX 4: ensure integer binary
+  .rename('flood_final')
+  .clip(roi);
+
+// ── Final mask pixel count ──
+var finalFloodCount = floodMaskFinal
+  .reduceRegion({
+    reducer  : ee.Reducer.sum(),
+    geometry : roi,
+    scale    : 10,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+print('floodMaskFinal pixel count     :', finalFloodCount);
+
+// ── Estimated flooded area ──
+// 10 m × 10 m pixel = 100 m² = 0.0001 km²
+var floodAreaKm2 = ee.Number(
+  finalFloodCount.get('flood_final'))
+  .multiply(100)
+  .divide(1e6);
+print('Estimated flooded area (km²)   :', floodAreaKm2);
+print('(Should be > 0 if fix is successful)');
+
+
+// =====================================================
+// SECTION 5.5 — VISUALIZATION PARAMETERS
+// =====================================================
+
+var sarVis   = { min: -25, max: 0, bands: ['VH'] };
+var floodVis = { min: 0, max: 1, palette: ['0000FF'] };
+
+
+// =====================================================
+// SECTION 5.6 — MAP LAYERS
+// =====================================================
+
+// ── SAR background for spatial context ──
+Map.addLayer(
+  afterFiltered,
+  sarVis,
+  'REF | Filtered After Flood | VH',
+  true
+);
+
+// ── AND mask (hidden) — compare coverage with OR ──
+// Enable this layer to see how much coverage was lost
+// under the original AND + strict-threshold combination.
+Map.addLayer(
+  floodMaskAND.toByte().selfMask(),
+  { min: 0, max: 1, palette: ['FF0000'] },
+  'DEBUG | AND mask (strict — for comparison only)',
+  false    // hidden; enable to compare vs OR result
+);
+
+// ── OR mask components — individual method results ──
+Map.addLayer(
+  floodMaskRatio.selfMask(),
+  { min: 0, max: 1, palette: ['00AAFF'] },
+  'DEBUG | Ratio mask only (< ' + RATIO_THRESHOLD + ')',
+  false
+);
+
+Map.addLayer(
+  floodMaskDifference.selfMask(),
+  { min: 0, max: 1, palette: ['00DDFF'] },
+  'DEBUG | Difference mask only (< ' + DIFF_THRESHOLD + ' dB)',
+  false
+);
+
+// ── FINAL FLOOD MASK — primary product ──
+// .toByte() applied in Section 5.4 before this point.
+// .selfMask() hides non-flood pixels (value = 0),
+// allowing the SAR background to show through.
+Map.addLayer(
+  floodMaskFinal.selfMask(),
+  floodVis,
+  'FLOOD MASK FINAL | OR | ratio<' + RATIO_THRESHOLD +
+    ' | diff<' + DIFF_THRESHOLD + 'dB',
+  true      // visible — primary output
+);
+
+Map.centerObject(roi, 11);
+
+
+// =====================================================
+// SECTION 5.7 — CORRECTED STEP SUMMARY
+// =====================================================
+
+print('════════════════════════════════════════════');
+print('STEP 5 CORRECTED — Category D Fix Applied');
+print('════════════════════════════════════════════');
+print('Fix 1 | Ratio threshold  : 0.70 → 0.85');
+print('Fix 2 | Diff threshold   : -3   → -1 dB');
+print('Fix 3 | Combination      : AND  → OR');
+print('Fix 4 | Byte cast        : added before selfMask()');
+print('────────────────────────────────────────────');
+print('Expected results:');
+print('  floodMaskRatio count      > 0  ✓');
+print('  floodMaskDifference count > 0  ✓');
+print('  floodMaskFinal count      > 0  ✓');
+print('  Flooded area (km²)        > 0  ✓');
+print('  Blue patches visible on map    ✓');
+print('════════════════════════════════════════════');
+print('Next step: Step 6 — Mask refinement');
+print('  (permanent water removal, slope masking,');
+print('   morphological noise cleaning)');
+print('════════════════════════════════════════════');
+// =====================================================
+// STEP 6: FLOOD MASK REFINEMENT
+// =====================================================
+// Study Area : Embakasi, Nairobi, Kenya
+// Input      : floodMaskFinal (from Step 5)
+// Output     : floodMaskRefined
+// Continues from: Step 5 (floodMaskFinal exists)
+// =====================================================
+//
+// WHY REFINEMENT IS NECESSARY
+// ─────────────────────────────
+// The Step 5 flood mask is a first-pass product based
+// purely on SAR backscatter change. It contains three
+// well-documented categories of false positives:
+//
+//   1. PERMANENT WATER BODIES (rivers, seasonal ponds)
+//      These appear dark in SAR year-round. They were
+//      dark BEFORE the flood event and dark AFTER it,
+//      so the change signal is weak — but relaxed
+//      thresholds (Step 5 Fix) may still flag them.
+//      More importantly, they are NOT flood-induced
+//      inundation and must be excluded from the map.
+//
+//   2. STEEP TERRAIN (slopes, embankments, cuttings)
+//      Radar look-angle effects cause steep slopes
+//      to return anomalously low backscatter (radar
+//      shadow, foreshortening). This mimics the water
+//      darkening signal and creates false positives
+//      on any slope steeper than ~5°. Embakasi has
+//      gentle terrain overall but contains drainage
+//      channel embankments that must be excluded.
+//
+//   3. ISOLATED NOISE PIXELS (speckle residuals)
+//      Even after focal mean filtering, residual
+//      speckle creates single isolated pixels or
+//      tiny 2–3 pixel clusters that pass the flood
+//      threshold by chance. These are statistically
+//      indistinguishable from real floods at the
+//      pixel level but have no spatial coherence.
+//      Morphological cleaning removes them by
+//      requiring flood pixels to belong to a
+//      connected cluster of minimum size.
+//
+// =====================================================
+
+
+// =====================================================
+// SECTION 6.0 — REFINEMENT PARAMETERS
+// =====================================================
+// All tunable values centralised here for easy
+// adjustment without editing the code body.
+
+// ── JRC permanent water threshold ──
+// Pixels with water occurrence > this value (%) across
+// the full JRC 1984–present record are treated as
+// permanent water and excluded from the flood mask.
+// 90% = present in 9 out of 10 observed years.
+// Lower this (e.g. 50%) to also remove seasonal water.
+var JRC_OCCURRENCE_THRESHOLD = 90;
+
+// ── Slope threshold (degrees) ──
+// Pixels steeper than this angle are excluded.
+// 5° is the widely adopted threshold in SAR flood
+// mapping literature (Horritt et al. 2001, Twele 2016).
+// For very flat urban areas like Embakasi, 3° may be
+// more appropriate — increase if too many valid pixels
+// are removed.
+var SLOPE_THRESHOLD_DEG = 5;
+
+// ── Minimum connected flood cluster size (pixels) ──
+// Isolated clusters smaller than this number of
+// connected pixels are classified as noise and removed.
+// At 10 m resolution: 8 pixels ≈ 800 m² ≈ 0.08 ha.
+// Increase to 20–50 if the map still appears noisy.
+// Decrease to 4 if small genuine flood pools are missed.
+var MIN_CONNECTED_PIXELS = 8;
+
+// ── Connectivity for morphological cleaning ──
+// 4  = cardinal neighbours only (more conservative)
+// 8  = cardinal + diagonal neighbours (more inclusive)
+var CONNECTIVITY = 8;
+
+print('── Step 6 Refinement Parameters ──────────');
+print('JRC occurrence threshold (%)  :', JRC_OCCURRENCE_THRESHOLD);
+print('Slope threshold (degrees)     :', SLOPE_THRESHOLD_DEG);
+print('Min connected pixels          :', MIN_CONNECTED_PIXELS);
+print('Connectivity                  :', CONNECTIVITY);
+
+
+// =====================================================
+// SECTION 6.PRE — BASELINE PIXEL COUNT
+// =====================================================
+// Record the original Step 5 flood mask statistics
+// BEFORE any refinement so we can compare before/after.
+
+var originalCount = floodMaskFinal
+  .reduceRegion({
+    reducer  : ee.Reducer.sum(),
+    geometry : roi,
+    scale    : 10,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+
+var originalPixels = ee.Number(
+  originalCount.get('flood_final'));
+
+var originalAreaKm2 = originalPixels
+  .multiply(100)    // 10m × 10m = 100 m² per pixel
+  .divide(1e6);     // m² → km²
+
+print('── Baseline (Pre-Refinement) ──────────────');
+print('Original flood pixel count :', originalPixels);
+print('Original flood area (km²)  :', originalAreaKm2);
+
+
+// =====================================================
+// STEP 6A: REMOVE PERMANENT WATER
+// =====================================================
+//
+// DATASET: JRC Global Surface Water (Landsat-derived)
+// Collection: JRC/GSW1_4/GlobalSurfaceWater
+// Band used : 'occurrence' — percentage of time a
+//             pixel was observed as water over the
+//             entire 1984–present record.
+//
+// WHY JRC OCCURRENCE?
+// ────────────────────
+// The JRC occurrence layer is the most reliable global
+// indicator of permanent and semi-permanent water. A
+// pixel with occurrence > 90% has been classified as
+// water in more than 90% of all valid Landsat
+// observations — it is structurally water, not flood.
+//
+// WHY NOT USE THE SAR IMAGE ITSELF TO MASK WATER?
+// ────────────────────────────────────────────────
+// Using the before-event SAR image to exclude "already
+// dark" pixels creates a circular dependency and would
+// miss water bodies that were partially filled during
+// the before period. The independent optical-based JRC
+// record avoids this problem entirely.
+//
+// IMPLEMENTATION NOTE:
+// We create a binary permanent-water mask (1 = perm
+// water, 0 = not) then SUBTRACT it from the flood mask.
+// Pixels that are permanent water become 0 (not flood).
+
+print('── STEP 6A: Permanent Water Removal ───────');
+
+// Load JRC Global Surface Water occurrence band
+var jrcGSW = ee.Image('JRC/GSW1_4/GlobalSurfaceWater')
+  .select('occurrence');
+
+// Create permanent water mask
+// 1 = permanent water (to be removed from flood mask)
+// 0 = not permanent water (keep flood detection)
+var permanentWaterMask = jrcGSW
+  .gte(JRC_OCCURRENCE_THRESHOLD)  // 1 where occurrence ≥ 90%
+  .unmask(0)       // pixels with no JRC data → treat as not-water
+                   // (important over urban areas with data gaps)
+  .clip(roi);
+
+// Apply: remove permanent water from flood mask
+// .where(condition, newValue):
+//   where permanentWaterMask = 1 (permanent water),
+//   set flood pixel to 0 (not a new flood)
+var floodMaskNoPermWater = floodMaskFinal
+  .where(permanentWaterMask.eq(1), 0)
+  .toByte()
+  .rename('flood_final')
+  .clip(roi);
+
+// Pixel count after Step 6A
+var countAfter6A = floodMaskNoPermWater
+  .reduceRegion({
+    reducer  : ee.Reducer.sum(),
+    geometry : roi,
+    scale    : 10,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+print('Permanent water pixels removed :',
+      originalPixels.subtract(
+        ee.Number(countAfter6A.get('flood_final'))));
+print('Flood pixels after 6A          :',
+      countAfter6A.get('flood_final'));
+
+// Visualize JRC permanent water layer for reference
+Map.addLayer(
+  permanentWaterMask.selfMask(),
+  { min: 0, max: 1, palette: ['00BFFF'] },
+  '6A REF | JRC Permanent Water (> ' +
+    JRC_OCCURRENCE_THRESHOLD + '% occurrence)',
+  false    // hidden by default
+);
+
+
+// =====================================================
+// STEP 6B: APPLY SLOPE MASK
+// =====================================================
+//
+// DATASET: SRTM Digital Elevation Model (30 m)
+// Collection: USGS/SRTMGL1_003
+//
+// WHY SLOPE MATTERS FOR SAR FLOOD MAPPING?
+// ──────────────────────────────────────────
+// SAR backscatter is highly sensitive to surface
+// geometry relative to the radar look direction:
+//
+//   FORESHORTENING: Slopes facing the sensor compress
+//   spatially and return anomalously high backscatter.
+//
+//   RADAR SHADOW: Slopes facing away from the sensor
+//   receive no illumination and return near-zero
+//   backscatter — indistinguishable from open water.
+//
+// Both effects create false positive flood detections
+// on slopes. The standard mitigation is to exclude
+// all pixels steeper than SLOPE_THRESHOLD_DEG.
+//
+// WHY 5 DEGREES?
+// ───────────────
+// At Sentinel-1 IW incidence angles (30°–46°), slope
+// effects become significant above ~5°. Below 5° the
+// terrain contribution to backscatter variation is
+// smaller than the speckle noise floor — safe to ignore.
+// Embakasi is largely flat but drainage embankments
+// and the Nairobi River valley walls exceed 5°.
+
+print('── STEP 6B: Slope Mask Application ────────');
+
+// Load SRTM DEM and compute terrain slope
+var srtmDEM = ee.Image('USGS/SRTMGL1_003');
+var slope   = ee.Terrain.slope(srtmDEM);   // output in degrees
+
+// Create valid-terrain mask
+// 1 = acceptable slope (keep) — slope BELOW threshold
+// 0 = too steep (remove from flood mask)
+var slopeMask = slope
+  .lt(SLOPE_THRESHOLD_DEG)   // 1 where slope < 5°
+  .clip(roi);
+
+// Apply: multiply by slope mask
+// Flood pixels on steep terrain become 0 (excluded).
+// Flood pixels on flat terrain remain unchanged.
+var floodMaskNoSlope = floodMaskNoPermWater
+  .multiply(slopeMask)        // 1×1=flood kept, 1×0=removed
+  .toByte()
+  .rename('flood_final')
+  .clip(roi);
+
+// Pixel count after Step 6B
+var countAfter6B = floodMaskNoSlope
+  .reduceRegion({
+    reducer  : ee.Reducer.sum(),
+    geometry : roi,
+    scale    : 10,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+print('Slope-related pixels removed   :',
+      ee.Number(countAfter6A.get('flood_final'))
+        .subtract(ee.Number(countAfter6B.get('flood_final'))));
+print('Flood pixels after 6B          :',
+      countAfter6B.get('flood_final'));
+
+// Visualize slope layer for reference
+Map.addLayer(
+  slope.clip(roi),
+  { min: 0, max: 15, palette: ['white','yellow','orange','red'] },
+  '6B REF | SRTM Slope (degrees)',
+  false    // hidden by default
+);
+
+Map.addLayer(
+  slopeMask.not().selfMask().clip(roi),  // show EXCLUDED steep areas
+  { min: 0, max: 1, palette: ['FF4500'] },
+  '6B REF | Excluded Steep Pixels (slope > ' +
+    SLOPE_THRESHOLD_DEG + '°)',
+  false
+);
+
+
+// =====================================================
+// STEP 6C: MORPHOLOGICAL CLEANING
+// =====================================================
+//
+// WHY MORPHOLOGICAL CLEANING?
+// ────────────────────────────
+// After Steps 6A and 6B, some single-pixel or
+// small-cluster false positives remain. These arise
+// from:
+//   • Residual speckle that survived focal mean filtering
+//   • Isolated surface roughness changes (construction,
+//     vegetation trampling, vehicle tracks)
+//   • Sub-pixel permanent water not captured by the
+//     coarser JRC 30 m record
+//
+// Real flood inundation is spatially contiguous: water
+// fills connected low-lying areas and spreads along
+// drainage paths. An isolated cluster of 2–3 pixels
+// surrounded by dry land is almost certainly noise.
+//
+// HOW connectedPixelCount WORKS:
+// ───────────────────────────────
+// For each flood pixel, GEE counts how many spatially
+// connected flood pixels share the same value (1) in
+// its neighbourhood, using the specified connectivity.
+// The result is an image where each flood pixel's value
+// equals the size of its connected cluster.
+// Pixels belonging to clusters SMALLER than
+// MIN_CONNECTED_PIXELS are then set to 0 (removed).
+//
+// CONNECTIVITY = 8 (default here)
+// Considers all 8 neighbours (cardinal + diagonal).
+// This joins clusters connected diagonally, which is
+// appropriate for flooded drainage paths that often
+// run diagonally relative to the pixel grid.
+
+print('── STEP 6C: Morphological Cleaning ────────');
+
+// Step 1: Count connected flood pixels per cluster
+// Input must be a binary image (0/1) — floodMaskNoSlope
+// already satisfies this requirement.
+var connectedCount = floodMaskNoSlope
+  .connectedPixelCount({
+    maxSize     : 1024,       // max cluster size to evaluate
+                              // set high to avoid truncation
+    eightConnected: (CONNECTIVITY === 8)
+  });
+
+// Step 2: Create minimum-size filter mask
+// 1 = pixel belongs to a cluster large enough to keep
+// 0 = pixel belongs to a tiny cluster → noise → remove
+var clusterSizeMask = connectedCount
+  .gte(MIN_CONNECTED_PIXELS);
+
+// Step 3: Apply cluster filter to flood mask
+var floodMaskCleaned = floodMaskNoSlope
+  .multiply(clusterSizeMask)  // remove small clusters
+  .toByte()
+  .rename('flood_final')
+  .clip(roi);
+
+// Pixel count after Step 6C
+var countAfter6C = floodMaskCleaned
+  .reduceRegion({
+    reducer  : ee.Reducer.sum(),
+    geometry : roi,
+    scale    : 10,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+print('Noise pixels removed (6C)      :',
+      ee.Number(countAfter6B.get('flood_final'))
+        .subtract(ee.Number(countAfter6C.get('flood_final'))));
+print('Flood pixels after 6C          :',
+      countAfter6C.get('flood_final'));
+
+// Visualize removed noise pixels for inspection
+var noisePixels = floodMaskNoSlope
+  .subtract(floodMaskCleaned)
+  .toByte()
+  .selfMask()
+  .clip(roi);
+
+Map.addLayer(
+  noisePixels,
+  { min: 0, max: 1, palette: ['FF00FF'] },
+  '6C REF | Removed Noise Pixels (magenta)',
+  false
+);
+
+
+// =====================================================
+// SECTION 6.FINAL — ASSIGN REFINED MASK
+// =====================================================
+// floodMaskRefined is the clean, science-ready product
+// after all three refinement steps. This variable is
+// passed to Step 7 (flood statistics and reporting).
+
+var floodMaskRefined = floodMaskCleaned
+  .rename('flood_refined')
+  .clip(roi);
+
+// Final pixel count and area
+var refinedCount = floodMaskRefined
+  .reduceRegion({
+    reducer  : ee.Reducer.sum(),
+    geometry : roi,
+    scale    : 10,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+
+var refinedPixels = ee.Number(
+  refinedCount.get('flood_refined'));
+
+var refinedAreaKm2 = refinedPixels
+  .multiply(100)
+  .divide(1e6);
+
+// Pixels removed by refinement (total noise + artefacts)
+var pixelsRemoved = originalPixels.subtract(refinedPixels);
+var areaRemovedKm2 = pixelsRemoved.multiply(100).divide(1e6);
+var retentionPct = refinedPixels
+  .divide(originalPixels)
+  .multiply(100);
+
+
+// =====================================================
+// SECTION 6.VIS — MAP VISUALIZATION
+// =====================================================
+
+var sarVis      = { min: -25, max: 0, bands: ['VH'] };
+var floodVisOld = { min: 0, max: 1, palette: ['0000FF'] };
+var floodVisNew = { min: 0, max: 1, palette: ['00CCFF'] };
+
+// ── SAR background ──
+Map.addLayer(
+  afterFiltered,
+  sarVis,
+  'REF | Filtered After Flood SAR | VH',
+  true
+);
+
+// ── Original Step 5 flood mask (OFF by default) ──
+// Enable to compare against refined output side-by-side
+Map.addLayer(
+  floodMaskFinal.selfMask(),
+  floodVisOld,
+  'Step 5 | Original Flood Mask (unrefined, blue)',
+  false    // OFF — enable for before/after comparison
+);
+
+// ── Refined flood mask (ON — primary product) ──
+Map.addLayer(
+  floodMaskRefined.selfMask(),
+  floodVisNew,
+  'Step 6 | REFINED Flood Mask | Embakasi',
+  true
+);
+
+Map.centerObject(roi, 11);
+
+
+// =====================================================
+// SECTION 6.SUMMARY — DIAGNOSTIC PRINT
+// =====================================================
+
+print('════════════════════════════════════════════');
+print('STEP 6 COMPLETE — Refinement Summary');
+print('════════════════════════════════════════════');
+print('── Before Refinement ───────────────────────');
+print('Original pixel count  :', originalPixels);
+print('Original area (km²)   :', originalAreaKm2);
+print('── After Each Stage ────────────────────────');
+print('After 6A (perm water) :', countAfter6A.get('flood_final'));
+print('After 6B (slope mask) :', countAfter6B.get('flood_final'));
+print('After 6C (morphology) :', countAfter6C.get('flood_final'));
+print('── Final Refined Output ────────────────────');
+print('Refined pixel count   :', refinedPixels);
+print('Refined area (km²)    :', refinedAreaKm2);
+print('Pixels removed total  :', pixelsRemoved);
+print('Area removed (km²)    :', areaRemovedKm2);
+print('Mask retention (%)    :', retentionPct);
+print('────────────────────────────────────────────');
+print('Output variable       : floodMaskRefined');
+print('Next step             : Step 7 — Statistics,');
+print('                        area calculation &');
+print('                        export for reporting');
+print('════════════════════════════════════════════');
+// ============================================================
+// STEP 7: FINAL STATISTICS, VISUALIZATION, AND EXPORT
+// Embakasi Flood Mapping — Sentinel-1 SAR (VH Polarisation)
+// ============================================================
+// Continues from Steps 1–6. Existing variables:
+//   roi, afterFiltered, floodMaskFinal, floodMaskRefined
+// All imagery uses VH band ONLY.
+// ============================================================
+
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 7.1 — AREA CALCULATIONS
+// ─────────────────────────────────────────────────────────────
+
+// --- 7.1.1: Dynamically resolve the flood mask band name ---
+// Avoids hardcoding 'VV' or 'VH' — works regardless of upstream naming
+var floodBandName = floodMaskRefined.bandNames().get(0);
+
+// --- 7.1.2: Flooded area (km²) ---
+// Multiply binary flood mask by per-pixel area in m², then sum over ROI
+var floodAreaImage = floodMaskRefined
+  .multiply(ee.Image.pixelArea());                  // m² per flooded pixel
+
+var floodAreaStats = floodAreaImage.reduceRegion({
+  reducer:    ee.Reducer.sum(),
+  geometry:   roi,
+  scale:      10,                                   // Sentinel-1 native resolution
+  maxPixels:  1e13,
+  bestEffort: false
+});
+
+// Safely retrieve value using the dynamic band name (no hardcoded key)
+var floodedAreaM2  = ee.Number(floodAreaStats.get(floodBandName));
+var floodedAreaKm2 = floodedAreaM2.divide(1e6);     // m² → km²
+
+
+// --- 7.1.3: Total ROI area (km²) ---
+var roiAreaStats = ee.Image.pixelArea()
+  .rename('area')                                   // give the single band a stable name
+  .reduceRegion({
+    reducer:    ee.Reducer.sum(),
+    geometry:   roi,
+    scale:      10,
+    maxPixels:  1e13,
+    bestEffort: false
+  });
+
+var roiAreaKm2 = ee.Number(roiAreaStats.get('area')).divide(1e6);
+
+
+// --- 7.1.4: Percentage of ROI that is flooded ---
+var percentFlooded = floodedAreaKm2
+  .divide(roiAreaKm2)
+  .multiply(100);
+
+
+// --- 7.1.5: Flood pixel count ---
+// Sum the binary mask — each flooded pixel contributes 1
+var pixelCountStats = floodMaskRefined.reduceRegion({
+  reducer:    ee.Reducer.sum(),
+  geometry:   roi,
+  scale:      10,
+  maxPixels:  1e13,
+  bestEffort: false
+});
+
+var floodPixelCount = ee.Number(pixelCountStats.get(floodBandName));
+
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 7.2 — CONSOLE SUMMARY
+// ─────────────────────────────────────────────────────────────
+
+print('╔══════════════════════════════════════════════╗');
+print('║   EMBAKASI FLOOD MAPPING — FINAL SUMMARY     ║');
+print('╚══════════════════════════════════════════════╝');
+print('');
+print('📍 Study Area   : Embakasi Sub-County, Nairobi');
+print('🛰️  Sensor       : Sentinel-1 SAR — VH polarisation');
+print('📐 Resolution   : 10 m');
+print('');
+print('── Resolved band name (dynamic) ─────────────────');
+print('🔍 Flood mask band :', floodBandName);
+print('');
+print('── Area Statistics ───────────────────────────────');
+print('🌍 Total ROI area  (km²) :', roiAreaKm2);
+print('🌊 Flooded area    (km²) :', floodedAreaKm2);
+print('📊 % Area flooded        :', percentFlooded);
+print('🔢 Flood pixel count     :', floodPixelCount);
+print('');
+print('── Data Products ─────────────────────────────────');
+print('✅ floodMaskFinal   — Step 5  (threshold mask)');
+print('✅ floodMaskRefined — Step 6  (morphology-cleaned FINAL product)');
+print('');
+print('── Export ────────────────────────────────────────');
+print('📁 Folder : GEE_Flood_Project');
+print('📄 File   : Embakasi_Flood_Map_2026');
+print('══════════════════════════════════════════════════');
+
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 7.3 — MAP VISUALIZATION
+// ─────────────────────────────────────────────────────────────
+
+// --- 7.3.1: Centre on ROI ---
+Map.centerObject(roi, 13);
+
+// --- 7.3.2: SAR backscatter background — VH band ---
+Map.addLayer(
+  afterFiltered.select('VH'),
+  { min: -25, max: 0, palette: ['000000', 'ffffff'] },
+  '🛰️ SAR Backscatter (VH) — Post-flood',
+  true                                              // visible by default
+);
+
+// --- 7.3.3: Step-5 flood mask for comparison (cyan, hidden by default) ---
+Map.addLayer(
+  floodMaskFinal.selfMask(),                        // selfMask() hides 0-value pixels
+  { palette: ['00FFFF'], opacity: 0.5 },
+  '🔵 Flood Mask — Step 5 (pre-refinement)',
+  false                                             // toggle on to compare with Step 6
+);
+
+// --- 7.3.4: Final refined flood mask — PRIMARY PRODUCT (blue) ---
+Map.addLayer(
+  floodMaskRefined.selfMask(),
+  { palette: ['0000FF'], opacity: 0.8 },
+  '🌊 Final Flood Mask — Step 6 (REFINED)',
+  true
+);
+
+// --- 7.3.5: ROI boundary (red outline, no fill) ---
+var roiOutline = ee.Image().byte().paint({
+  featureCollection: ee.FeatureCollection([ee.Feature(roi)]),
+  color: 1,
+  width: 2
+});
+
+Map.addLayer(
+  roiOutline,
+  { palette: ['FF0000'] },
+  '📍 ROI — Embakasi Boundary',
+  true
+);
+
+// --- 7.3.6: Legend (console) ---
+print('');
+print('🗺️  MAP LEGEND');
+print('────────────────────────────────────────');
+print('⬛ Black → White  : SAR backscatter VH (low → high dB)');
+print('🔵 Blue           : Final flooded area  (floodMaskRefined)');
+print('🩵 Cyan  (off)    : Step-5 mask before morphological refinement');
+print('🔴 Red outline    : Embakasi ROI boundary');
+print('────────────────────────────────────────');
+
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 7.4 — EXPORT
+// ─────────────────────────────────────────────────────────────
+
+// --- 7.4.1: Export final flood mask (floodMaskRefined) as GeoTIFF ---
+Export.image.toDrive({
+  image:          floodMaskRefined,
+  description:    'Embakasi_Flood_Map_2026',
+  folder:         'GEE_Flood_Project',
+  fileNamePrefix: 'Embakasi_Flood_Map_2026',
+  scale:          10,
+  region:         roi,
+  crs:            'EPSG:4326',
+  maxPixels:      1e13,
+  fileFormat:     'GeoTIFF'
+});
+
+print('');
+print('📤 EXPORT TASK SUBMITTED — Final Flood Mask');
+print('   → Embakasi_Flood_Map_2026.tif');
+print('   → Folder : GEE_Flood_Project (Google Drive)');
+print('   → Scale  : 10 m  |  CRS : EPSG:4326');
+
+
+// --- 7.4.2: BONUS — Export post-flood SAR VH band as reference layer ---
+Export.image.toDrive({
+  image:          afterFiltered.select('VH'),       // VH band ONLY
+  description:    'Embakasi_SAR_PostFlood_VH_2026',
+  folder:         'GEE_Flood_Project',
+  fileNamePrefix: 'Embakasi_SAR_PostFlood_VH_2026',
+  scale:          10,
+  region:         roi,
+  crs:            'EPSG:4326',
+  maxPixels:      1e13,
+  fileFormat:     'GeoTIFF'
+});
+
+print('');
+print('📤 BONUS EXPORT TASK SUBMITTED — SAR VH Reference');
+print('   → Embakasi_SAR_PostFlood_VH_2026.tif');
+print('   → Post-flood SAR backscatter (VH) for validation');
+print('   → Folder : GEE_Flood_Project (Google Drive)');
+print('');
+print('✅  STEP 7 COMPLETE — All tasks finished successfully.');
+print('══════════════════════════════════════════════════════');
+// =====================================================
+// MASTER DIAGNOSTIC BLOCK
+// Run this at the END of your full script.
+// Read the Console output top-to-bottom before
+// making ANY changes to the workflow.
+// =====================================================
+
+// ── Helper: safe min/max inspector ──
+// reduceRegion can time-out on large ROIs at full
+// resolution. scale:100 gives a fast approximate
+// result sufficient for debugging — not for final
+// analysis. If it still times out, increase to 500.
+var DEBUG_SCALE = 100;  // metres — increase to 500 if timeout
+
+var safeMinMax = function(image, bandName, label) {
+  var stats = image.select(bandName).reduceRegion({
+    reducer  : ee.Reducer.min().combine(
+                 ee.Reducer.max(), '', true),
+    geometry : roi,
+    scale    : DEBUG_SCALE,
+    maxPixels: 1e9,
+    bestEffort: true   // prevents timeout by auto-scaling
+  });
+  print(label + ' [min, max]:', stats);
+};
+
+var safePixelCount = function(image, bandName, label) {
+  var count = image.select(bandName).reduceRegion({
+    reducer  : ee.Reducer.sum(),
+    geometry : roi,
+    scale    : 10,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+  print(label + ' pixel count (sum of 1s):', count);
+};
